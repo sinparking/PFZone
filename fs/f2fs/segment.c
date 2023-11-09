@@ -2450,31 +2450,45 @@ static int is_next_segment_free(struct f2fs_sb_info *sbi,
 /*
  * Find a new segment from the free segments bitmap to right order
  * This function should be returned with success, otherwise BUG
+ * dir 用来指示向左还是向右查找
  */
 static void get_new_segment(struct f2fs_sb_info *sbi,
 			unsigned int *newseg, bool new_sec, int dir)
 {
 	struct free_segmap_info *free_i = FREE_I(sbi);
 	unsigned int segno, secno, zoneno;
-	unsigned int total_zones = MAIN_SECS(sbi) / sbi->secs_per_zone;
-	unsigned int hint = GET_SEC_FROM_SEG(sbi, *newseg);
-	unsigned int old_zoneno = GET_ZONE_FROM_SEG(sbi, *newseg);
+	unsigned int total_zones = MAIN_SECS(sbi) / sbi->secs_per_zone; // section / sec_per_zone, 也就是zone的个数 zone = section
+	unsigned int hint = GET_SEC_FROM_SEG(sbi, *newseg);				// ((segno) / (sbi)->segs_per_sec)，seg所在的sec编号，也就是zone编号
+	unsigned int old_zoneno = GET_ZONE_FROM_SEG(sbi, *newseg);		// 按理来说，sec = zone时，hint和old_zoneno是一样的
 	unsigned int left_start = hint;
 	bool init = true;
 	int go_left = 0;
 	int i;
 
 	spin_lock(&free_i->segmap_lock);
-
+	
+	// new_sec == false时，且当前section的下一个seg还存在
 	if (!new_sec && ((*newseg + 1) % sbi->segs_per_sec)) {
+		/*
+			find_next_zero_bit
+				addr:位图地址
+				size:位图的大小
+				offset:起始偏移量
+			位图是这样的 addr[size];
+			在[offset~size)范围内去搜索一个空闲的位
+		*/
 		segno = find_next_zero_bit(free_i->free_segmap,
 			GET_SEG_FROM_SEC(sbi, hint + 1), *newseg + 1);
-		if (segno < GET_SEG_FROM_SEC(sbi, hint + 1))
+		if (segno < GET_SEG_FROM_SEC(sbi, hint + 1))	// 找到了
 			goto got_it;
 	}
+	// new_sec 或者 当前sec的segs用完了，分配新的sec
 find_other_zone:
+	// 从secmap里面从当前zone（sec）往右后去找一个新的空闲sec
 	secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), hint);
 	if (secno >= MAIN_SECS(sbi)) {
+		// 如果往右没找到，则从头全局再找一次
+		// CURSEG_WARM_DATA 和 CURSEG_COLD_DATA时为ALLOC_RIGHT,其余为ALLOC_LEFT
 		if (dir == ALLOC_RIGHT) {
 			secno = find_next_zero_bit(free_i->free_secmap,
 							MAIN_SECS(sbi), 0);
@@ -2487,25 +2501,28 @@ find_other_zone:
 	if (go_left == 0)
 		goto skip_left;
 
+	// 如果是ALLOC_LEFT，则从hint-1开始检测free_sec的每一位，如果该位为1（在使用），则while继续; 如果为0，则找到一个空闲的sec，退出while循环
 	while (test_bit(left_start, free_i->free_secmap)) {
 		if (left_start > 0) {
 			left_start--;
-			continue;
+			continue;	
 		}
+		// 这最后一次while，left_start == 0时，再尝试往右找到一个空闲的sec
 		left_start = find_next_zero_bit(free_i->free_secmap,
 							MAIN_SECS(sbi), 0);
-		f2fs_bug_on(sbi, left_start >= MAIN_SECS(sbi));
+		f2fs_bug_on(sbi, left_start >= MAIN_SECS(sbi)); 
 		break;
 	}
 	secno = left_start;
 skip_left:
+	// 找到了sec，但是segno是从sec第一个开始的，前提是这个sec是空的
 	segno = GET_SEG_FROM_SEC(sbi, secno);
 	zoneno = GET_ZONE_FROM_SEC(sbi, secno);
 
 	/* give up on finding another zone */
 	if (!init)
 		goto got_it;
-	if (sbi->secs_per_zone == 1)
+	if (sbi->secs_per_zone == 1)	// zone == sec时这里就直接返回了
 		goto got_it;
 	if (zoneno == old_zoneno)
 		goto got_it;
@@ -2570,6 +2587,7 @@ static unsigned int __get_next_segno(struct f2fs_sb_info *sbi, int type)
 	sanity_check_seg_type(sbi, seg_type);
 
 	/* if segs_per_sec is large than 1, we need to keep original policy. */
+	// zns ssd下，1个sec有多个seg，也就是返回的一定是curseg->segno
 	if (__is_large_section(sbi))
 		return curseg->segno;
 
@@ -2613,7 +2631,7 @@ static void new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
 
 	if (test_opt(sbi, NOHEAP))
 		dir = ALLOC_RIGHT;
-
+	// zns情况下，下列返回值segno = curseg->segno
 	segno = __get_next_segno(sbi, type);
 	get_new_segment(sbi, &segno, new_sec, dir);
 	curseg->next_segno = segno;
@@ -3326,6 +3344,7 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		sanity_check_seg_type(sbi, se->type);
 		f2fs_bug_on(sbi, IS_NODESEG(se->type));
 	}
+	// 获取一个block
 	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
 
 	f2fs_bug_on(sbi, curseg->next_blkoff >= sbi->blocks_per_seg);
@@ -3339,6 +3358,7 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	 */
 	__add_sum_entry(sbi, type, sum);
 
+	// 更新curseg下一个可用的block位置
 	__refresh_next_blkoff(sbi, curseg);
 
 	stat_inc_block_count(sbi, curseg);
@@ -3359,6 +3379,7 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
 		update_sit_entry(sbi, old_blkaddr, -1);
 
+	// 如果当前segment已经满了，分配新的segment
 	if (!__has_curseg_space(sbi, curseg)) {
 		if (from_gc)
 			get_atssr_segment(sbi, type, se->type,
@@ -4218,12 +4239,15 @@ static int build_sit_info(struct f2fs_sb_info *sbi)
 	unsigned int bitmap_size, main_bitmap_size, sit_bitmap_size;
 
 	/* allocate memory for SIT information */
+	// 为sit info 分配空间
 	sit_i = f2fs_kzalloc(sbi, sizeof(struct sit_info), GFP_KERNEL);
 	if (!sit_i)
 		return -ENOMEM;
-
+	
+	// 把sit info赋值给sbi
 	SM_I(sbi)->sit_info = sit_i;
 
+	/* 根据main area的segment的数目,给每一个segment在内存中分配一个entry结构 */
 	sit_i->sentries =
 		f2fs_kvzalloc(sbi, array_size(sizeof(struct seg_entry),
 					      MAIN_SEGS(sbi)),
@@ -4232,6 +4256,10 @@ static int build_sit_info(struct f2fs_sb_info *sbi)
 		return -ENOMEM;
 
 	main_bitmap_size = f2fs_bitmap_size(MAIN_SEGS(sbi));
+	/* 这个bitmap是记录segment是否为脏的bitmap,作用是当segment分配了一个block之后,
+     * 这个segment对应的entry信息就会改变,因此将这个segment标记为脏,之后需要通过某种策略
+     * 将数据写回到SIT区域
+     */
 	sit_i->dirty_sentries_bitmap = f2fs_kvzalloc(sbi, main_bitmap_size,
 								GFP_KERNEL);
 	if (!sit_i->dirty_sentries_bitmap)
@@ -4245,9 +4273,11 @@ static int build_sit_info(struct f2fs_sb_info *sbi)
 	sit_i->bitmap = f2fs_kvzalloc(sbi, bitmap_size, GFP_KERNEL);
 	if (!sit_i->bitmap)
 		return -ENOMEM;
-
+    /* 这个bitmap是segment的bitmap,作用是当segment全部block都没有使用过,
+     * 这个segment就需要标记free
+     */
 	bitmap = sit_i->bitmap;
-
+	/* 这里给每一个内存entry的记录block状态的bitmap分配空间，SIT_VBLOCK_MAP_SIZE=64 */
 	for (start = 0; start < MAIN_SEGS(sbi); start++) {
 		sit_i->sentries[start].cur_valid_map = bitmap;
 		bitmap += SIT_VBLOCK_MAP_SIZE;
@@ -4278,9 +4308,11 @@ static int build_sit_info(struct f2fs_sb_info *sbi)
 	}
 
 	/* get information related with SIT */
+	/* 获取SIT区域包含了多少个segment去存放f2fs_sit_block */
 	sit_segs = le32_to_cpu(raw_super->segment_count_sit) >> 1;
 
 	/* setup SIT bitmap from ckeckpoint pack */
+	/* 从checkpoint中恢复bitmap的状态 */
 	sit_bitmap_size = __bitmap_size(sbi, SIT_BITMAP);
 	src_bitmap = __bitmap_ptr(sbi, SIT_BITMAP);
 
@@ -4321,17 +4353,19 @@ static int build_free_segmap(struct f2fs_sb_info *sbi)
 	unsigned int bitmap_size, sec_bitmap_size;
 
 	/* allocate memory for free segmap information */
+	/* 给管理segment分配状态的free_segmap_info分配内存空间 */
 	free_i = f2fs_kzalloc(sbi, sizeof(struct free_segmap_info), GFP_KERNEL);
 	if (!free_i)
 		return -ENOMEM;
 
 	SM_I(sbi)->free_info = free_i;
-
+   	/* 根据segment的数目初始化free map的大小 */
 	bitmap_size = f2fs_bitmap_size(MAIN_SEGS(sbi));
 	free_i->free_segmap = f2fs_kvmalloc(sbi, bitmap_size, GFP_KERNEL);
 	if (!free_i->free_segmap)
 		return -ENOMEM;
 
+	/* 默认情况下，不一定：由于1 section = 1 segment，将sec map看作为根据segment map同等作用就好 */
 	sec_bitmap_size = f2fs_bitmap_size(MAIN_SECS(sbi));
 	free_i->free_secmap = f2fs_kvmalloc(sbi, sec_bitmap_size, GFP_KERNEL);
 	if (!free_i->free_secmap)
@@ -4384,6 +4418,7 @@ static int build_curseg(struct f2fs_sb_info *sbi)
 	return restore_curseg_summaries(sbi);
 }
 
+/* 建立物理entry以及内存entry的关系 */
 static int build_sit_entries(struct f2fs_sb_info *sbi)
 {
 	struct sit_info *sit_i = SIT_I(sbi);
@@ -4506,7 +4541,7 @@ static void init_free_segmap(struct f2fs_sb_info *sbi)
 		if (f2fs_usable_blks_in_seg(sbi, start) == 0)
 			continue;
 		sentry = get_seg_entry(sbi, start);
-		if (!sentry->valid_blocks)
+		if (!sentry->valid_blocks)	// segment一个block都没使用，设置为free
 			__set_free(sbi, start);
 		else
 			SIT_I(sbi)->written_valid_blocks +=
@@ -4514,6 +4549,7 @@ static void init_free_segmap(struct f2fs_sb_info *sbi)
 	}
 
 	/* set use the current segments */
+	/* 从checkpoint的curseg中恢复可用信息 */
 	for (type = CURSEG_HOT_DATA; type <= CURSEG_COLD_NODE; type++) {
 		struct curseg_info *curseg_t = CURSEG_I(sbi, type);
 		__set_test_and_inuse(sbi, curseg_t->segno);
@@ -4606,6 +4642,7 @@ static int build_dirty_segmap(struct f2fs_sb_info *sbi)
 			return -ENOMEM;
 	}
 
+	// 函数恢复脏segment的信息
 	init_dirty_segmap(sbi);
 	return init_victim_secmap(sbi);
 }
@@ -4912,6 +4949,8 @@ static unsigned int get_zone_idx(struct f2fs_sb_info *sbi, unsigned int secno,
 /*
  * Return the usable segments in a section based on the zone's
  * corresponding zone capacity. Zone is equal to a section.
+ * 
+ * Zone = section，返回section里面找到可用的segment数量
  */
 static inline unsigned int f2fs_usable_zone_segs_in_sec(
 		struct f2fs_sb_info *sbi, unsigned int segno)
@@ -4946,6 +4985,9 @@ static inline unsigned int f2fs_usable_zone_segs_in_sec(
  * conventional zone. For segments partially contained in a sequential
  * zone capacity, the number of usable blocks up to the zone capacity
  * is returned. 0 is returned in all other cases.
+ * 
+ * 返回段中可用块的数量。对于完全包含在顺序区域容量或常规区域内的段，返回的块数始终等于段中的块数。
+ * 对于部分包含在顺序分区容量中的段，将返回达到分区容量的可用块数。在所有其他情况下都返回0。
  */
 static inline unsigned int f2fs_usable_zone_blks_in_seg(
 			struct f2fs_sb_info *sbi, unsigned int segno)
@@ -5113,10 +5155,12 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
 		return err;
 
 	/* reinit free segmap based on SIT */
+	// 从SIT的物理区域存放的物理entry与内存的entry建立联系
 	err = build_sit_entries(sbi);
 	if (err)
 		return err;
 
+	// 从内存entry以及checkpoint中恢复free segment的信息:
 	init_free_segmap(sbi);
 	err = build_dirty_segmap(sbi);
 	if (err)
