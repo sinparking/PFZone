@@ -22,6 +22,9 @@
 #include "gc.h"
 #include "trace.h"
 #include <trace/events/f2fs.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/random.h>
 
 #define __reverse_ffz(x) __reverse_ffs(~(x))
 
@@ -34,7 +37,6 @@ static unsigned long __reverse_ulong(unsigned char *str)
 {
 	unsigned long tmp = 0;
 	int shift = 24, idx = 0;
-
 #if BITS_PER_LONG == 64
 	shift = 56;
 #endif
@@ -2447,12 +2449,13 @@ static int is_next_segment_free(struct f2fs_sb_info *sbi,
 	return 0;
 }
 
+
 /*
  * Find a new segment from the free segments bitmap to right order
  * This function should be returned with success, otherwise BUG
  * dir 用来指示向左还是向右查找
  */
-static void get_new_segment(struct f2fs_sb_info *sbi,
+static void get_new_segment_copy(struct f2fs_sb_info *sbi,
 			unsigned int *newseg, bool new_sec, int dir)
 {
 	struct free_segmap_info *free_i = FREE_I(sbi);
@@ -2553,6 +2556,116 @@ got_it:
 	__set_inuse(sbi, segno);
 	*newseg = segno;
 	spin_unlock(&free_i->segmap_lock);
+}
+
+static void get_new_segment(struct f2fs_sb_info *sbi,
+                            unsigned int *newseg, bool new_sec, int dir)
+{
+        struct free_segmap_info *free_i = FREE_I(sbi);
+        unsigned int segno, secno, zoneno;
+        unsigned int total_zones = MAIN_SECS(sbi) / sbi->secs_per_zone; // section / sec_per_zone, 也就是zone的个数 zone = section
+        unsigned int hint = GET_SEC_FROM_SEG(sbi, *newseg);				// ((segno) / (sbi)->segs_per_sec)，seg所在的sec编号，也就是zone编号
+        unsigned int old_zoneno = GET_ZONE_FROM_SEG(sbi, *newseg);		// 按理来说，sec = zone时，hint和old_zoneno是一样的
+        unsigned int left_start = hint;
+        bool init = true;
+        int go_left = 0;
+        int i;
+        unsigned char buffer[8]; // 用于存储随机数的缓冲区
+        unsigned int num;
+
+        spin_lock(&free_i->segmap_lock);
+
+        // new_sec == false时，且当前section的下一个seg还存在
+        if (!new_sec && ((*newseg + 1) % sbi->segs_per_sec)) {
+                /*
+                        find_next_zero_bit
+                                addr:位图地址
+                                size:位图的大小
+                                offset:起始偏移量
+                        位图是这样的 addr[size];
+                        在[offset~size)范围内去搜索一个空闲的位
+                */
+                segno = find_next_zero_bit(free_i->free_segmap,
+                                           GET_SEG_FROM_SEC(sbi, hint + 1), *newseg + 1);
+                if (segno < GET_SEG_FROM_SEC(sbi, hint + 1))	// 找到了
+                        goto got_it;
+        }
+        // new_sec 或者 当前sec的segs用完了，分配新的sec
+find_other_zone:
+        // 从secmap里面从当前zone（sec）往右后去找一个新的空闲sec
+
+        get_random_bytes(buffer, sizeof(buffer)); // 获取随机数
+        num = *(int*)buffer;
+        hint = num % total_zones;
+        f2fs_info(sbi, "%s(%d)random hint start %d\r\n", __FUNCTION__ , __LINE__, hint);
+        secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), hint);
+        if (secno >= MAIN_SECS(sbi)) {
+                // 如果往右没找到，则从头全局再找一次
+                // CURSEG_WARM_DATA 和 CURSEG_COLD_DATA时为ALLOC_RIGHT,其余为ALLOC_LEFT
+                if (dir == ALLOC_RIGHT) {
+                        secno = find_next_zero_bit(free_i->free_secmap,
+                                                   MAIN_SECS(sbi), 0);
+                        f2fs_bug_on(sbi, secno >= MAIN_SECS(sbi));
+                } else {
+                        go_left = 1;
+                        left_start = hint - 1;
+                }
+        }
+        if (go_left == 0)
+                goto skip_left;
+
+        // 如果是ALLOC_LEFT，则从hint-1开始检测free_sec的每一位，如果该位为1（在使用），则while继续; 如果为0，则找到一个空闲的sec，退出while循环
+        while (test_bit(left_start, free_i->free_secmap)) {
+                if (left_start > 0) {
+                        left_start--;
+                        continue;
+                }
+                // 这最后一次while，left_start == 0时，再尝试往右找到一个空闲的sec
+                left_start = find_next_zero_bit(free_i->free_secmap,
+                                                MAIN_SECS(sbi), 0);
+                f2fs_bug_on(sbi, left_start >= MAIN_SECS(sbi));
+                break;
+        }
+        secno = left_start;
+skip_left:
+        // 找到了sec，但是segno是从sec第一个开始的，前提是这个sec是空的
+        segno = GET_SEG_FROM_SEC(sbi, secno);
+        zoneno = GET_ZONE_FROM_SEC(sbi, secno);
+
+        /* give up on finding another zone */
+        if (!init)
+                goto got_it;
+        if (sbi->secs_per_zone == 1)	// zone == sec时这里就直接返回了
+                goto got_it;
+        if (zoneno == old_zoneno)
+                goto got_it;
+        if (dir == ALLOC_LEFT) {
+                if (!go_left && zoneno + 1 >= total_zones)
+                        goto got_it;
+                if (go_left && zoneno == 0)
+                        goto got_it;
+        }
+        for (i = 0; i < NR_CURSEG_TYPE; i++)
+                if (CURSEG_I(sbi, i)->zone == zoneno)
+                        break;
+
+        if (i < NR_CURSEG_TYPE) {
+                /* zone is in user, try another */
+                if (go_left)
+                        hint = zoneno * sbi->secs_per_zone - 1;
+                else if (zoneno + 1 >= total_zones)
+                        hint = 0;
+                else
+                        hint = (zoneno + 1) * sbi->secs_per_zone;
+                init = false;
+                goto find_other_zone;
+        }
+got_it:
+        /* set it as dirty segment in free segmap */
+        f2fs_bug_on(sbi, test_bit(segno, free_i->free_segmap));
+        __set_inuse(sbi, segno);
+        *newseg = segno;
+        spin_unlock(&free_i->segmap_lock);
 }
 
 static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified)
