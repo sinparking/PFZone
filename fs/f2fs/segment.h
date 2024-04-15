@@ -267,6 +267,17 @@ struct sit_info {
 	unsigned int last_victim[MAX_GC_POLICY]; /* last victim segment # */
 };
 
+// 记录每个segment的状态
+struct seg_status {
+        unsigned short status;  // 当前segment的状态，至少包含：0空闲，1已使用，2写满, 3被GC暂时无法分配作为写入
+        unsigned short cur_blkoff; // 当前待写入的blkoff位置，0~max-1是有效的，max代表已经满了，数值上应该是等于curseg->blkoff的
+};
+
+struct random_group {
+        int zones[4];
+        int last_write_index;
+};
+
 struct free_segmap_info {
 	unsigned int start_segno;	/* start segment number logically */
 	unsigned int free_segments;	/* # of free segments */
@@ -274,6 +285,12 @@ struct free_segmap_info {
 	spinlock_t segmap_lock;		/* free segmap lock */
 	unsigned long *free_segmap;	/* free segment bitmap */
 	unsigned long *free_secmap;	/* free section bitmap */
+
+        // zone 状态 0表示未使用，1表示已经使用(已经被分配)，2表示被GC但是还没恢复的状态
+        unsigned int zone_count;
+        unsigned int * zone_status;
+        struct seg_status * seg_info;
+        struct random_group rand_zone_group[6];
 };
 
 /* Notice: The order of dirty type is same with CURSEG_XXX in f2fs.h */
@@ -304,6 +321,12 @@ struct victim_selection {
 					int, int, char, unsigned long long);
 };
 
+// 单次zone写入限制添加
+enum {
+  WRITE_LIMIT = 16,
+  MAX_LIMIT = 512
+};
+
 /* for active log information */
 struct curseg_info {
 	struct mutex curseg_mutex;		/* lock for consistency */
@@ -317,6 +340,9 @@ struct curseg_info {
 	unsigned int zone;			/* current zone number */
 	unsigned int next_segno;		/* preallocated segment */
 	bool inited;				/* indicate inmem log is inited */
+
+        // curseg每次写这么多就得切换
+        int write_limit_per_allocate;
 };
 
 struct sit_entry_set {
