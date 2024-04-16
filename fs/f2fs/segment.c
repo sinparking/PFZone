@@ -5283,6 +5283,51 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
 	if (err)
 		return err;
 
+        {
+                // 打印初始化的curseg信息，并且初始化Zone Group
+                f2fs_info(sbi, "init CURSEG---"
+                               "data : hot %d, warm %d, cold %d  "
+                               "node: hot %d, warm %d, cold %d ",
+                          sbi->sm_info->curseg_array[CURSEG_HOT_DATA].zone, sbi->sm_info->curseg_array[CURSEG_WARM_DATA].zone, sbi->sm_info->curseg_array[CURSEG_COLD_DATA].zone,
+                          sbi->sm_info->curseg_array[CURSEG_HOT_NODE].zone, sbi->sm_info->curseg_array[CURSEG_WARM_NODE].zone, sbi->sm_info->curseg_array[CURSEG_COLD_NODE].zone
+                );
+                sm_info->free_info->zone_per_group = 4;
+                sm_info->free_info->zone_count = MAIN_SECS(sbi);
+                sm_info->free_info->zone_status = f2fs_kvzalloc(sbi, array_size(sizeof(int), MAIN_SECS(sbi)), GFP_KERNEL);
+                sm_info->free_info->seg_info = f2fs_kvzalloc(sbi, array_size(sizeof(struct seg_status), MAIN_SEGS(sbi)), GFP_KERNEL); // seginfo切换的时候记录上次写入的末尾
+                int i;
+                for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
+                        struct curseg_info* curseg = CURSEG_I(sbi, i);
+                        sm_info->free_info->rand_zone_group[i].zones[0] = curseg->zone;
+                        sm_info->free_info->rand_zone_group[i].last_write_index = 0;
+                        sm_info->free_info->zone_status[curseg->zone] = 1; // 占用的zone
+                        curseg->write_limit_per_allocate = (curseg->next_blkoff / WRITE_LIMIT + 1) * WRITE_LIMIT; // 初始化curseg
+                }
+                f2fs_info(sbi, "zone per group:%d, zone_count:%d ", sm_info->free_info->zone_per_group,  sm_info->free_info->zone_count);
+                for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
+                        int j;
+                        for (j = 1; j < 4; j ++) {
+                                unsigned int rand_num = 0;
+                                do {
+                                        get_random_bytes(&rand_num, sizeof(rand_num));
+                                        rand_num = rand_num % sm_info->free_info->zone_count;
+                                        if (sm_info->free_info->zone_status[rand_num] == 0) {
+                                          sm_info->free_info->rand_zone_group[i].zones[j] = rand_num;
+                                          sm_info->free_info->zone_status[rand_num] = 1; // 占用的zone
+                                          break;
+                                        }
+                                } while (1);
+                        }
+                }
+                for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
+                        f2fs_info(sbi, "log %d", i);
+                        int j;
+                        for (j = 0; j < sm_info->free_info->zone_per_group; j ++) {
+                                f2fs_info(sbi, "rand_zone_group[%d] = %d", j, sm_info->free_info->rand_zone_group[i].zones[j]);
+                        }
+                }
+        }
+
 	init_min_max_mtime(sbi);
 	return 0;
 }

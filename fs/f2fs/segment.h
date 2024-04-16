@@ -275,7 +275,7 @@ struct seg_status {
 
 struct random_group {
         int zones[4];
-        int last_write_index;
+        int last_write_index;  // 使用时用于记录上一个写入的zone，分配时用于计数
 };
 
 struct free_segmap_info {
@@ -287,6 +287,7 @@ struct free_segmap_info {
 	unsigned long *free_secmap;	/* free section bitmap */
 
         // zone 状态 0表示未使用，1表示已经使用(已经被分配)，2表示被GC但是还没恢复的状态
+        unsigned int zone_per_group;
         unsigned int zone_count;
         unsigned int * zone_status;
         struct seg_status * seg_info;
