@@ -5284,6 +5284,7 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
 		return err;
 
         {
+                int i;
                 // 打印初始化的curseg信息，并且初始化Zone Group
                 f2fs_info(sbi, "init CURSEG---"
                                "data : hot %d, warm %d, cold %d  "
@@ -5294,16 +5295,28 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
                 sm_info->free_info->zone_per_group = 4;
                 sm_info->free_info->zone_count = MAIN_SECS(sbi);
                 sm_info->free_info->zone_status = f2fs_kvzalloc(sbi, array_size(sizeof(int), MAIN_SECS(sbi)), GFP_KERNEL);
+                // 初始化zone status
+                for (i = 0; i < MAIN_SECS(sbi); i ++) {
+                        sm_info->free_info->zone_status[i] = 0;
+                }
                 sm_info->free_info->seg_info = f2fs_kvzalloc(sbi, array_size(sizeof(struct seg_status), MAIN_SEGS(sbi)), GFP_KERNEL); // seginfo切换的时候记录上次写入的末尾
-                int i;
+                // 初始化segment status
+                for (i = 0; i < MAIN_SEGS(sbi); i ++) {
+                        sm_info->free_info->seg_info[i].status = 0;
+                        sm_info->free_info->seg_info[i].cur_blkoff = 0;
+                }
+                // 初始化curseg对应的数据信息
                 for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
                         struct curseg_info* curseg = CURSEG_I(sbi, i);
                         sm_info->free_info->rand_zone_group[i].zones[0] = curseg->zone;
                         sm_info->free_info->rand_zone_group[i].last_write_index = 0;
                         sm_info->free_info->zone_status[curseg->zone] = 1; // 占用的zone
                         curseg->write_limit_per_allocate = (curseg->next_blkoff / WRITE_LIMIT + 1) * WRITE_LIMIT; // 初始化curseg
+                        sm_info->free_info->seg_info[curseg->segno].status = 1;     // 把初始的segment标为占用状态
+                        sm_info->free_info->seg_info[curseg->segno].cur_blkoff = 0; // 初始的cur_blkoff = 0;
                 }
                 f2fs_info(sbi, "zone per group:%d, zone_count:%d ", sm_info->free_info->zone_per_group,  sm_info->free_info->zone_count);
+                // 分配随机组的流程
                 for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
                         int j;
                         for (j = 1; j < 4; j ++) {
