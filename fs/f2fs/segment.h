@@ -482,12 +482,21 @@ static inline void __set_inuse(struct f2fs_sb_info *sbi,
 	struct free_segmap_info *free_i = FREE_I(sbi);
 	unsigned int secno = GET_SEC_FROM_SEG(sbi, segno);
 
-	set_bit(segno, free_i->free_segmap);
-	free_i->free_segments--;
-	if (!test_and_set_bit(secno, free_i->free_secmap))
-		free_i->free_sections--;
+        // 第一次分配的时候 干以下工作
+        if (free_i->seg_info[segno].status == 0) {
+                set_bit(segno, free_i->free_segmap);
+                free_i->free_segments--;
+                free_i->seg_info[segno].status = 1;
+        }
+
+	if (!test_and_set_bit(secno, free_i->free_secmap)) {
+                free_i->free_sections--;
+                f2fs_info(sbi, "zone %d allocate, status from %d to %d", secno,  free_i->zone_status[secno], 1);
+                free_i->zone_status[secno] = 1;
+        }
 }
 
+// zone, segment的状态从GC恢复为0
 static inline void __set_test_and_free(struct f2fs_sb_info *sbi,
 		unsigned int segno, bool inmem)
 {
@@ -500,6 +509,9 @@ static inline void __set_test_and_free(struct f2fs_sb_info *sbi,
 	spin_lock(&free_i->segmap_lock);
 	if (test_and_clear_bit(segno, free_i->free_segmap)) {
 		free_i->free_segments++;
+                // segment 重回状态
+                free_i->seg_info[segno].status = 0;
+                free_i->seg_info[segno].cur_blkoff = 0;
 
 		if (!inmem && IS_CURSEC(sbi, secno))
 			goto skip_free;
@@ -507,7 +519,12 @@ static inline void __set_test_and_free(struct f2fs_sb_info *sbi,
 				start_segno + sbi->segs_per_sec, start_segno);
 		if (next >= start_segno + usable_segs) {
 			if (test_and_clear_bit(secno, free_i->free_secmap))
-				free_i->free_sections++;
+                        {
+                          free_i->free_sections++;
+                          // zone 重回状态
+                          f2fs_info(sbi, "zone %d free, status from %d to %d", secno, free_i->zone_status[secno], 0);
+                          free_i->zone_status[secno] = 0;
+                        }
 		}
 	}
 skip_free:

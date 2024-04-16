@@ -33,6 +33,13 @@ static struct kmem_cache *discard_cmd_slab;
 static struct kmem_cache *sit_entry_set_slab;
 static struct kmem_cache *inmem_entry_slab;
 
+static bool __has_curseg_space(struct f2fs_sb_info *sbi,
+                               struct curseg_info *curseg)
+{
+  return curseg->next_blkoff < f2fs_usable_blks_in_seg(sbi,
+                                                       curseg->segno);
+}
+
 static unsigned long __reverse_ulong(unsigned char *str)
 {
 	unsigned long tmp = 0;
@@ -867,6 +874,7 @@ static void __remove_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno,
  * Adding dirty entry into seglist is not critical operation.
  * If a given segment is one of current working segments, it won't be added.
  */
+// segment变为3，zone变为2 表示正在GC
 static void locate_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno)
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
@@ -886,6 +894,21 @@ static void locate_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno)
 		ckpt_valid_blocks == usable_blocks)) {
 		__locate_dirty_segment(sbi, segno, PRE);
 		__remove_dirty_segment(sbi, segno, DIRTY);
+
+                {
+                        int zone_id = GET_SEC_FROM_SEG(sbi, segno);
+                        spin_lock(&sbi->sm_info->free_info->segmap_lock);
+
+                        // for seg_info; segment从DIRTY放入PRE，表示被GC
+                        sbi->sm_info->free_info->seg_info[segno].status = 3;
+
+                        if (sbi->sm_info->free_info->zone_status[zone_id] == 1){
+                                f2fs_info(sbi, "zone %d GC, status from %d to %d", zone_id, sbi->sm_info->free_info->zone_status[zone_id], 2);
+                                sbi->sm_info->free_info->zone_status[zone_id] = 2;
+                        }
+                        spin_unlock(&sbi->sm_info->free_info->segmap_lock);
+                }
+
 	} else if (valid_blocks < usable_blocks) {
 		__locate_dirty_segment(sbi, segno, DIRTY);
 	} else {
@@ -2559,7 +2582,7 @@ got_it:
 }
 
 static void get_new_segment(struct f2fs_sb_info *sbi,
-                            unsigned int *newseg, bool new_sec, int dir)
+                            unsigned int *newseg, bool new_sec, int dir, int type)
 {
         struct free_segmap_info *free_i = FREE_I(sbi);
         unsigned int segno, secno, zoneno;
@@ -2574,6 +2597,12 @@ static void get_new_segment(struct f2fs_sb_info *sbi,
         unsigned int num;
 
         spin_lock(&free_i->segmap_lock);
+
+        struct curseg_info *curseg = CURSEG_I(sbi, type);
+        if (!__has_curseg_space(sbi, curseg)) { // segment用完了 状态变为2
+                free_i->seg_info[curseg->segno].status = 2;
+        }
+        free_i->seg_info[curseg->segno].cur_blkoff = curseg->next_blkoff;
 
         // new_sec == false时，且当前section的下一个seg还存在
         if (!new_sec && ((*newseg + 1) % sbi->segs_per_sec)) {
@@ -2661,8 +2690,10 @@ skip_left:
                 goto find_other_zone;
         }
 got_it:
+        if (free_i->seg_info[segno].status == 0) // 第一次分配的segment，将bitmap置为1
+                f2fs_bug_on(sbi, test_bit(segno, free_i->free_segmap));
         /* set it as dirty segment in free segmap */
-        f2fs_bug_on(sbi, test_bit(segno, free_i->free_segmap));
+//        f2fs_bug_on(sbi, test_bit(segno, free_i->free_segmap));
         __set_inuse(sbi, segno);
         *newseg = segno;
         spin_unlock(&free_i->segmap_lock);
@@ -2746,7 +2777,7 @@ static void new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
 		dir = ALLOC_RIGHT;
 	// zns情况下，下列返回值segno = curseg->segno
 	segno = __get_next_segno(sbi, type);
-	get_new_segment(sbi, &segno, new_sec, dir);
+	get_new_segment(sbi, &segno, new_sec, dir, type);
 	curseg->next_segno = segno;
 	reset_curseg(sbi, type, 1);
 	curseg->alloc_type = LFS;
@@ -3242,12 +3273,7 @@ out:
 	return err;
 }
 
-static bool __has_curseg_space(struct f2fs_sb_info *sbi,
-					struct curseg_info *curseg)
-{
-	return curseg->next_blkoff < f2fs_usable_blks_in_seg(sbi,
-							curseg->segno);
-}
+
 
 int f2fs_rw_hint_to_seg_type(enum rw_hint hint)
 {
