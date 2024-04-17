@@ -324,7 +324,7 @@ struct victim_selection {
 
 // 单次zone写入限制添加
 enum {
-  WRITE_LIMIT = 16,
+  WRITE_LIMIT = 512,
   MAX_LIMIT = 512
 };
 

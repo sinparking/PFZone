@@ -40,6 +40,14 @@ static bool __has_curseg_space(struct f2fs_sb_info *sbi,
                                                        curseg->segno);
 }
 
+// 防御性编程
+static bool __not_reach_limit(struct f2fs_sb_info *sbi,
+                              struct curseg_info *curseg)
+{
+  return curseg->next_blkoff < curseg->write_limit_per_allocate;
+}
+
+
 static unsigned long __reverse_ulong(unsigned char *str)
 {
 	unsigned long tmp = 0;
@@ -2602,6 +2610,7 @@ static void get_new_segment(struct f2fs_sb_info *sbi,
         if (!__has_curseg_space(sbi, curseg)) { // segment用完了 状态变为2
                 free_i->seg_info[curseg->segno].status = 2;
         }
+        // 切换的时候，记录下上次写完的位置
         free_i->seg_info[curseg->segno].cur_blkoff = curseg->next_blkoff;
 
         // new_sec == false时，且当前section的下一个seg还存在
@@ -2710,6 +2719,17 @@ static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified)
 	curseg->zone = GET_ZONE_FROM_SEG(sbi, curseg->segno);
 	curseg->next_blkoff = 0;
 	curseg->next_segno = NULL_SEGNO;
+
+        {
+                //ADD
+                struct free_segmap_info *free_i = FREE_I(sbi);
+                spin_lock(&free_i->segmap_lock);
+                if (modified) {
+                        curseg->next_blkoff = free_i->seg_info[curseg->segno].cur_blkoff;
+                        curseg->write_limit_per_allocate = (curseg->next_blkoff / WRITE_LIMIT + 1) * WRITE_LIMIT;
+                }
+                spin_unlock(&free_i->segmap_lock);
+        }
 
 	sum_footer = &(curseg->sum_blk->footer);
 	memset(sum_footer, 0, sizeof(struct summary_footer));
@@ -3519,7 +3539,7 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		update_sit_entry(sbi, old_blkaddr, -1);
 
 	// 如果当前segment已经满了，分配新的segment
-	if (!__has_curseg_space(sbi, curseg)) {
+	if (!__has_curseg_space(sbi, curseg) || !(__not_reach_limit(sbi, curseg))) {
 		if (from_gc)
 			get_atssr_segment(sbi, type, se->type,
 						AT_SSR, se->mtime);
@@ -5311,7 +5331,7 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
 
         {
                 int i;
-                // 打印初始化的curseg信息，并且初始化Zone Group
+                // 打印初始化的curseg信息
                 f2fs_info(sbi, "init CURSEG---"
                                "data : hot %d, warm %d, cold %d  "
                                "node: hot %d, warm %d, cold %d ",
@@ -5340,6 +5360,7 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
                         curseg->write_limit_per_allocate = (curseg->next_blkoff / WRITE_LIMIT + 1) * WRITE_LIMIT; // 初始化curseg
                         sm_info->free_info->seg_info[curseg->segno].status = 1;     // 把初始的segment标为占用状态
                         sm_info->free_info->seg_info[curseg->segno].cur_blkoff = 0; // 初始的cur_blkoff = 0;
+                        curseg->write_limit_per_allocate = (curseg->next_blkoff / WRITE_LIMIT + 1) * WRITE_LIMIT;
                 }
                 f2fs_info(sbi, "zone per group:%d, zone_count:%d ", sm_info->free_info->zone_per_group,  sm_info->free_info->zone_count);
                 // 分配随机组的流程
