@@ -911,7 +911,7 @@ static void locate_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno)
                         sbi->sm_info->free_info->seg_info[segno].status = 3;
 
                         if (sbi->sm_info->free_info->zone_status[zone_id] == 1){
-                                f2fs_info(sbi, "zone %d GC, status from %d to %d", zone_id, sbi->sm_info->free_info->zone_status[zone_id], 2);
+//                                f2fs_info(sbi, "zone %d GC, status from %d to %d", zone_id, sbi->sm_info->free_info->zone_status[zone_id], 2);
                                 sbi->sm_info->free_info->zone_status[zone_id] = 2;
                         }
                         spin_unlock(&sbi->sm_info->free_info->segmap_lock);
@@ -2589,7 +2589,7 @@ got_it:
 	spin_unlock(&free_i->segmap_lock);
 }
 
-static void get_new_segment(struct f2fs_sb_info *sbi,
+static void get_new_segment_random(struct f2fs_sb_info *sbi,
                             unsigned int *newseg, bool new_sec, int dir, int type)
 {
         struct free_segmap_info *free_i = FREE_I(sbi);
@@ -2707,6 +2707,115 @@ got_it:
         *newseg = segno;
         spin_unlock(&free_i->segmap_lock);
 }
+
+static void get_new_segment(struct f2fs_sb_info *sbi,
+                            unsigned int *newseg, bool new_sec, int dir, int type)
+{
+        struct free_segmap_info *free_i = FREE_I(sbi);
+        unsigned int segno, secno, zoneno;
+        unsigned int total_zones = MAIN_SECS(sbi) / sbi->secs_per_zone; // section / sec_per_zone, 也就是zone的个数 zone = section
+        unsigned int hint = GET_SEC_FROM_SEG(sbi, *newseg);				// ((segno) / (sbi)->segs_per_sec)，seg所在的sec编号，也就是zone编号
+        unsigned int old_zoneno = GET_ZONE_FROM_SEG(sbi, *newseg);		// 按理来说，sec = zone时，hint和old_zoneno是一样的
+        unsigned int left_start = hint;
+        bool init = true;
+        int go_left = 0;
+        int i;
+        unsigned char buffer[8]; // 用于存储随机数的缓冲区
+        unsigned int num;
+
+        int next_zone;
+        int * last_write_index = &sbi->sm_info->free_info->rand_zone_group[type].last_write_index;
+        int * zone_status = &sbi->sm_info->free_info->zone_status[0];    // zone状态
+
+        spin_lock(&free_i->segmap_lock);
+
+        struct curseg_info *curseg = CURSEG_I(sbi, type);
+        if (!__has_curseg_space(sbi, curseg)) { // segment用完了 状态变为2
+                free_i->seg_info[curseg->segno].status = 2;
+        }
+        // 切换的时候，记录下上次写完的位置
+        free_i->seg_info[curseg->segno].cur_blkoff = curseg->next_blkoff;
+
+        // new_sec == false时，且当前section的下一个seg还存在
+        if (new_sec) {
+                goto new_sec_allocate;
+        }
+
+
+        // 下一个zone的index
+        for (i = 0; i < free_i->zone_per_group; i ++) {
+                *last_write_index = (*last_write_index + i + 1) % free_i->zone_per_group;
+                next_zone = free_i->rand_zone_group[type].zones[*last_write_index];
+                if (sec_usage_check(sbi, next_zone) && next_zone != hint) {
+                        continue;
+                }
+                if (zone_status[next_zone] == 2) {
+                        continue;
+                }
+                // 这个zone有空闲
+                segno = find_next_zero_bit(free_i->free_segmap, GET_SEG_FROM_SEC(sbi, next_zone + 1), GET_SEG_FROM_SEC(sbi, next_zone));
+                if (segno < GET_SEG_FROM_SEC(sbi, next_zone + 1)) {
+                        // 这个空闲的segment理应在我的框架里也是未分配
+                        f2fs_bug_on(sbi, free_i->seg_info[segno].status != 0);
+                        // 1.zone的第一个空闲segment
+                        if (segno == GET_SEG_FROM_SEC(sbi, next_zone)) {
+                                // f2fs_notice(sbi, "way2.1:zone %d, group %d status = %d, empty alloc seg %d", next_zone, zone_group_no, zone_group_status[zone_group_no], segno);
+                                goto got_it;
+                        }
+                        // 2.segno的前一个seg是否是部分写入，前一个segment的状态只能是0空闲，1部分写入，2写满
+                        // 但是位图既然找出来了，前一个就必然不能是空闲，只能是部分写入1或者写满2
+                        // 前一个为1 说明前一个还没写满，于是找前一个
+                        if (free_i->seg_info[segno - 1].status == 1) {
+                                segno = segno - 1;
+                                // f2fs_notice(sbi, "way2.2:zone %d, group %d status = %d, part alloc seg %d", next_zone, zone_group_no, zone_group_status[zone_group_no], segno);
+                                goto got_it;
+                        }
+                        // f2fs_notice(sbi, "way2.3:zone %d, group %d status = %d, empty alloc seg %d", next_zone, zone_group_no, zone_group_status[zone_group_no], segno);
+                        goto got_it;
+                }
+                // 这条路是可能找到了一个segment，也就是末尾的segment是部分写入
+                if (segno == GET_SEG_FROM_SEC(sbi, next_zone + 1)) {
+                        if (free_i->seg_info[segno - 1].status == 1) {
+                                segno = segno - 1;
+                                // f2fs_notice(sbi, "way2.4:zone %d, group %d status = %d, part alloc seg %d", next_zone, zone_group_no, zone_group_status[zone_group_no], segno);
+                                goto got_it;
+                        }
+                }
+        }
+new_sec_allocate:
+        // 这条路 代表组已经分配完 没有空闲的
+        free_i->rand_zone_group[type].last_write_index = 0;
+        int j;
+        for (j = 0; j < 4; j ++) {
+                unsigned int rand_num = 0;
+                int cnt = 0;
+                do {
+                        get_random_bytes(&rand_num, sizeof(rand_num));
+                        rand_num = rand_num % free_i->zone_count;
+                        if (free_i->zone_status[rand_num] == 0) {
+                                free_i->rand_zone_group[type].zones[j] = rand_num;
+                                free_i->zone_status[rand_num] = 1; // 占用的zone
+                                break;
+                        }
+                        cnt ++;
+                } while (cnt != 100);
+                if (cnt == 100) {
+                        f2fs_info(sbi, "fail got new zone");
+                        f2fs_bug_on(sbi, 1);
+                }
+        }
+        secno = free_i->rand_zone_group[type].zones[0];
+        segno = GET_SEG_FROM_SEC(sbi, secno);
+got_it:
+        if (free_i->seg_info[segno].status == 0) // 第一次分配的segment，将bitmap置为1
+                f2fs_bug_on(sbi, test_bit(segno, free_i->free_segmap));
+        /* set it as dirty segment in free segmap */
+        //        f2fs_bug_on(sbi, test_bit(segno, free_i->free_segmap));
+        __set_inuse(sbi, segno);
+        *newseg = segno;
+        spin_unlock(&free_i->segmap_lock);
+}
+
 
 static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified)
 {
@@ -5351,17 +5460,18 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
                         sm_info->free_info->seg_info[i].status = 0;
                         sm_info->free_info->seg_info[i].cur_blkoff = 0;
                 }
+		
                 // 初始化curseg对应的数据信息
                 for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
                         struct curseg_info* curseg = CURSEG_I(sbi, i);
                         sm_info->free_info->rand_zone_group[i].zones[0] = curseg->zone;
                         sm_info->free_info->rand_zone_group[i].last_write_index = 0;
                         sm_info->free_info->zone_status[curseg->zone] = 1; // 占用的zone
-                        curseg->write_limit_per_allocate = (curseg->next_blkoff / WRITE_LIMIT + 1) * WRITE_LIMIT; // 初始化curseg
                         sm_info->free_info->seg_info[curseg->segno].status = 1;     // 把初始的segment标为占用状态
                         sm_info->free_info->seg_info[curseg->segno].cur_blkoff = 0; // 初始的cur_blkoff = 0;
                         curseg->write_limit_per_allocate = (curseg->next_blkoff / WRITE_LIMIT + 1) * WRITE_LIMIT;
                 }
+
                 f2fs_info(sbi, "zone per group:%d, zone_count:%d ", sm_info->free_info->zone_per_group,  sm_info->free_info->zone_count);
                 // 分配随机组的流程
                 for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
@@ -5379,6 +5489,17 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
                                 } while (1);
                         }
                 }
+
+				
+				// 直接给所有的CURSEG分配一个新的组
+				struct sit_info *sit_i = SIT_I(sbi);
+				f2fs_info(sbi, "init groups for 6 logs");
+				for (i = 0; i <= CURSEG_COLD_NODE; ++ i) {
+					struct curseg_info* curseg = CURSEG_I(sbi, i);
+					sbi->sm_info->free_info->seg_info[curseg->segno].cur_blkoff = curseg->next_blkoff;
+					sit_i->s_ops->allocate_segment(sbi, i, true);
+				}
+
                 for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
                         f2fs_info(sbi, "log %d", i);
                         int j;

@@ -324,7 +324,7 @@ struct victim_selection {
 
 // 单次zone写入限制添加
 enum {
-  WRITE_LIMIT = 512,
+  WRITE_LIMIT = 16,
   MAX_LIMIT = 512
 };
 
@@ -489,9 +489,12 @@ static inline void __set_inuse(struct f2fs_sb_info *sbi,
                 free_i->seg_info[segno].status = 1;
         }
 
+        // 分配的时候手动将zone_status置为了1，但是系统的bitmap没有设置
+        // 导致打印的时候出现from 1 to 1
+        // 逻辑上应该是没有问题的
 	if (!test_and_set_bit(secno, free_i->free_secmap)) {
                 free_i->free_sections--;
-                f2fs_info(sbi, "zone %d allocate, status from %d to %d", secno,  free_i->zone_status[secno], 1);
+//                f2fs_info(sbi, "zone %d allocate, status from %d to %d", secno,  0, 1);
                 free_i->zone_status[secno] = 1;
         }
 }
@@ -522,7 +525,7 @@ static inline void __set_test_and_free(struct f2fs_sb_info *sbi,
                         {
                           free_i->free_sections++;
                           // zone 重回状态
-                          f2fs_info(sbi, "zone %d free, status from %d to %d", secno, free_i->zone_status[secno], 0);
+//                          f2fs_info(sbi, "zone %d free, status from %d to %d", secno, free_i->zone_status[secno], 0);
                           free_i->zone_status[secno] = 0;
                         }
 		}
