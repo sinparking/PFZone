@@ -2786,24 +2786,76 @@ new_sec_allocate:
         // 这条路 代表组已经分配完 没有空闲的
         free_i->rand_zone_group[type].last_write_index = 0;
         int j;
-        for (j = 0; j < 4; j ++) {
-                unsigned int rand_num = 0;
-                int cnt = 0;
-                do {
-                        get_random_bytes(&rand_num, sizeof(rand_num));
-                        rand_num = rand_num % free_i->zone_count;
-                        if (free_i->zone_status[rand_num] == 0) {
-                                free_i->rand_zone_group[type].zones[j] = rand_num;
-                                free_i->zone_status[rand_num] = 1; // 占用的zone
-                                break;
+        // 为每个组内分配新的zone
+        /*
+         分别从
+         0 4 8
+         1 5 9
+         2 6 10
+         3 7 11
+         去找
+        */
+        int zone_per_group = free_i->zone_per_group;
+        int totol_zones = MAIN_SECS(sbi);
+        static int my_flag = 0;
+        // 0 1 2 3 4 5 对应6个log初始化
+        if (unlikely(my_flag < 6)) {
+                f2fs_info(sbi, "初始化分配zone log:%d", my_flag);
+                for (j = 0; j < zone_per_group; j ++) {
+                        unsigned int zoneno = j;
+                        for (; zoneno < totol_zones; zoneno += zone_per_group) {
+                                if (free_i->zone_status[zoneno] == 0) {
+                                        free_i->rand_zone_group[type].zones[j] = zoneno;
+                                        free_i->zone_status[zoneno] = 1; // 占用的zone
+                                        break;
+                                }
                         }
-                        cnt ++;
-                } while (cnt != 100);
-                if (cnt == 100) {
-                        f2fs_info(sbi, "fail got new zone");
-                        f2fs_bug_on(sbi, 1);
+                        // 上面沒找到，尝试再找一次
+                        if (zoneno >= MAIN_SECS(sbi)) {
+                                zoneno = j;
+                                for (; zoneno < totol_zones; zoneno += zone_per_group) {
+                                        if (free_i->zone_status[zoneno] == 0) {
+                                          free_i->rand_zone_group[type].zones[j] = zoneno;
+                                          free_i->zone_status[zoneno] = 1; // 占用的zone
+                                          break;
+                                        }
+                                }
+                                if (zoneno >= MAIN_SECS(sbi)) {
+                                        f2fs_info(sbi, "fail got new zone");
+                                        f2fs_bug_on(sbi, 1);
+                                }
+                        }
+                }
+                my_flag ++;
+        } else {
+                for (j = 0; j < zone_per_group; j ++) {
+                        unsigned int zoneno = free_i->rand_zone_group[type].zones[j] + zone_per_group;
+                        for (; zoneno < totol_zones; zoneno += zone_per_group) {
+                                if (!test_bit(zoneno, free_i->free_secmap)) {
+                                        free_i->rand_zone_group[type].zones[j] = zoneno;
+                                        free_i->zone_status[zoneno] = 1; // 占用的zone
+                                        break;
+                                }
+                        }
+                        // 上面沒找到，尝试再找一次
+                        // 123
+                        if (zoneno >= MAIN_SECS(sbi)) {
+                                zoneno = j;
+                                for (; zoneno < totol_zones; zoneno += zone_per_group) {
+                                        if (!test_bit(zoneno, free_i->free_secmap)) {
+                                          free_i->rand_zone_group[type].zones[j] = zoneno;
+                                          free_i->zone_status[zoneno] = 1; // 占用的zone
+                                          break;
+                                        }
+                                }
+                                if (zoneno >= MAIN_SECS(sbi)) {
+                                        f2fs_info(sbi, "fail got new zone");
+                                        f2fs_bug_on(sbi, 1);
+                                }
+                        }
                 }
         }
+
         secno = free_i->rand_zone_group[type].zones[0];
         segno = GET_SEG_FROM_SEC(sbi, secno);
 got_it:
@@ -5474,31 +5526,31 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
 
                 f2fs_info(sbi, "zone per group:%d, zone_count:%d ", sm_info->free_info->zone_per_group,  sm_info->free_info->zone_count);
                 // 分配随机组的流程
-                for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
-                        int j;
-                        for (j = 1; j < 4; j ++) {
-                                unsigned int rand_num = 0;
-                                do {
-                                        get_random_bytes(&rand_num, sizeof(rand_num));
-                                        rand_num = rand_num % sm_info->free_info->zone_count;
-                                        if (sm_info->free_info->zone_status[rand_num] == 0) {
-                                          sm_info->free_info->rand_zone_group[i].zones[j] = rand_num;
-                                          sm_info->free_info->zone_status[rand_num] = 1; // 占用的zone
-                                          break;
-                                        }
-                                } while (1);
-                        }
-                }
+//                for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
+//                        int j;
+//                        for (j = 1; j < 4; j ++) {
+//                                unsigned int rand_num = 0;
+//                                do {
+//                                        get_random_bytes(&rand_num, sizeof(rand_num));
+//                                        rand_num = rand_num % sm_info->free_info->zone_count;
+//                                        if (sm_info->free_info->zone_status[rand_num] == 0) {
+//                                          sm_info->free_info->rand_zone_group[i].zones[j] = rand_num;
+//                                          sm_info->free_info->zone_status[rand_num] = 1; // 占用的zone
+//                                          break;
+//                                        }
+//                                } while (1);
+//                        }
+//                }
 
 				
-				// 直接给所有的CURSEG分配一个新的组
-				struct sit_info *sit_i = SIT_I(sbi);
-				f2fs_info(sbi, "init groups for 6 logs");
-				for (i = 0; i <= CURSEG_COLD_NODE; ++ i) {
-					struct curseg_info* curseg = CURSEG_I(sbi, i);
-					sbi->sm_info->free_info->seg_info[curseg->segno].cur_blkoff = curseg->next_blkoff;
-					sit_i->s_ops->allocate_segment(sbi, i, true);
-				}
+                // 直接给所有的CURSEG分配一个新的组
+                struct sit_info *sit_i = SIT_I(sbi);
+                f2fs_info(sbi, "init groups for 6 logs");
+                for (i = 0; i <= CURSEG_COLD_NODE; ++ i) {
+                        struct curseg_info* curseg = CURSEG_I(sbi, i);
+                        sbi->sm_info->free_info->seg_info[curseg->segno].cur_blkoff = curseg->next_blkoff;
+                        sit_i->s_ops->allocate_segment(sbi, i, true);
+                }
 
                 for (i = 0; i <= CURSEG_COLD_NODE; i ++) {
                         f2fs_info(sbi, "log %d", i);
@@ -5508,6 +5560,7 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
                         }
                 }
         }
+        f2fs_info(sbi, "rand版本的final");
 
 	init_min_max_mtime(sbi);
 	return 0;
